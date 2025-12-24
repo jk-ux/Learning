@@ -62,13 +62,18 @@ parser.add_argument('--sample_num', default=1, type=float, help='')
 parser.add_argument('--model', default='convnext_small_22k_224', type=str, metavar='MODEL', help='Name of model to train')
 parser.add_argument('--epochs', default=200, type=int, help='' )
 parser.add_argument('--fname', default='train.txt', type=str, help='Name of log txt')
-parser.add_argument('--steps', default=[80,120], type=int, help='' )
+parser.add_argument('--steps', default=[80,120], type=int, nargs='+', help='learning rate decay steps')
 # === 新添加的 DINOv2 参数 ===
 parser.add_argument('--dinov2', action='store_true', help='use DINOv2 backbone instead of ResNet/ConvNeXt')
 parser.add_argument('--dinov2_size', default='vitb14', type=str,choices=['vits14', 'vitb14', 'vitl14', 'vitg14'],help='DINOv2 model size: vits14(384d), vitb14(768d), vitl14(1024d), vitg14(1536d)')
 parser.add_argument('--use_cls_token', action='store_true',help='use CLS token as global feature (faster) instead of spatial pooling')
 parser.add_argument('--freeze_backbone', action='store_true',help='freeze DINOv2 backbone parameters (only train classifiers)')
 parser.add_argument('--dinov2_dropout', default=0.5, type=float,help='dropout rate for DINOv2 classifier heads')
+# === ⭐ 结构感知注意力参数 ===
+parser.add_argument('--use_structure_aware', action='store_true', 
+                    help='⭐ enable structure-aware attention mechanism')
+parser.add_argument('--use_hybrid', action='store_true',
+                    help='⭐ use hybrid backbone (DINOv2 + CNN)')
 # === TensorBoard 参数 ===
 parser.add_argument('--tensorboard', action='store_true', default=True, help='enable TensorBoard logging')
 parser.add_argument('--tb_log_dir', default='./tb_logs', type=str, help='TensorBoard log directory')
@@ -83,6 +88,14 @@ if not opt.resume:
     if opt.dinov2:
         copyfile('models/dinov2_backbone.py', dir_name + '/dinov2_backbone.py')
         copyfile('models/model.py', dir_name + '/model.py')
+        # ⭐ 如果使用结构感知，复制相关文件
+        if opt.use_structure_aware:
+            if os.path.exists('models/structure_attention.py'):
+                copyfile('models/structure_attention.py', dir_name + '/structure_attention.py')
+        # ⭐ 如果使用混合架构，复制相关文件
+        if opt.use_hybrid:
+            if os.path.exists('models/hybrid_backbone.py'):
+                copyfile('models/hybrid_backbone.py', dir_name + '/hybrid_backbone.py')
     else:
         copyfile('models/ConvNext/backbones/model_convnext.py', dir_name + '/model.py')
 
@@ -142,7 +155,7 @@ def train_model(model, opt, model_test, optimizer, scheduler, num_epochs=25):
     loss_kl = nn.KLDivLoss(reduction='batchmean')
     triplet_loss = Tripletloss(margin=opt.triplet_loss)
 
-    min_loss = 1.0
+    min_loss = 1.5
 
     warm_up = 0.1 # We start from the 0.1*lrRate
     warm_iteration = round(dataset_sizes['satellite']/opt.batchsize)*opt.warm_epoch # first 5 epoch
@@ -194,45 +207,73 @@ def train_model(model, opt, model_test, optimizer, scheduler, num_epochs=25):
             # zero the parameter gradients
             optimizer.zero_grad()
 
-            # forward
+            # ⭐ forward - 支持结构感知
             with autocast():
                 if opt.views == 2:
-                    outputs, outputs2 = model(inputs, inputs3)  # satellite 和 drone
+                    # ⭐ 尝试获取结构信息（如果启用）
+                    if opt.use_structure_aware:
+                        try:
+                            result = model(inputs, inputs3, return_structure=True)
+                            # 检查返回值格式
+                            if isinstance(result, tuple) and len(result) == 3:
+                                # (feat_info, attn_maps, align_embeds)
+                                feat_info, attn_maps, align_embeds = result
+                                outputs, outputs2 = feat_info
+                            else:
+                                # 降级到标准模式
+                                outputs, outputs2 = result if isinstance(result, tuple) else model(inputs, inputs3)
+                        except Exception as e:
+                            print(f"[WARNING] Structure-aware forward failed: {e}, falling back to standard mode")
+                            outputs, outputs2 = model(inputs, inputs3)
+                    else:
+                        # 标准模式
+                        outputs, outputs2 = model(inputs, inputs3)  # satellite 和 drone
+                        
                 elif opt.views == 3:
-                    outputs, outputs3, outputs2 = model(inputs, inputs2, inputs3)# satellite, street, drone
+                    outputs, outputs3, outputs2 = model(inputs, inputs2, inputs3)
             
+            # ========== Triplet Loss 计算 ==========
             f_triplet_loss = torch.tensor(0.0).cuda()
-            if opt.triplet_loss>0:
-                # 适配 DINOv2 输出：outputs = (预测列表, 特征)
-                if opt.dinov2:
-                    features = outputs[1]    # DINOv2 输出的全局特征
-                    features2 = outputs2[1]
-                    outputs = outputs[0]    # DINOv2 输出的分类预测
-                    outputs2 = outputs2[0]
+            if opt.triplet_loss > 0:
+                # ✅ 修正：统一处理输出格式
+                # 无论是 DINOv2 还是 ConvNeXt，输出格式都是 (predictions, features)
+                if isinstance(outputs, tuple) and len(outputs) == 2:
+                    # 训练模式且 return_f=True 时：outputs = (predictions_list, features_list)
+                    predictions1, features1 = outputs
+                    predictions2, features2 = outputs2
+                    
+                    # 用于 triplet loss 的特征
+                    split_num = opt.batchsize // opt.sample_num
+                    f_triplet_loss = cal_triplet_loss(
+                        features1, features2, labels, triplet_loss, split_num
+                    )
+                    
+                    # 用于分类的预测
+                    outputs = predictions1
+                    outputs2 = predictions2
                 else:
-                    features = outputs[1]
-                    features2 = outputs2[1]
-                    outputs = outputs[0]
-                    outputs2 = outputs2[0]
-                
-                split_num = opt.batchsize//opt.sample_num
-                f_triplet_loss = cal_triplet_loss(features,features2,labels,triplet_loss,split_num)
-
-            # 处理预测结果（多分类器列表）
-            if isinstance(outputs,list):
+                    # 如果没有返回特征（return_f=False），跳过triplet loss
+                    pass
+            
+            # ========== 分类损失计算 ==========
+            # 处理多分类器输出
+            if isinstance(outputs, list):
                 preds = []
                 preds2 = []
-                batch_acc1 = 0.0  # 批次级 satellite 准确率
-                batch_acc2 = 0.0  # 批次级 drone 准确率
-                for out,out2 in zip(outputs,outputs2):
-                    pred1 = torch.max(out.data,1)[1]
-                    pred2 = torch.max(out2.data,1)[1]
+                batch_acc1 = 0.0
+                batch_acc2 = 0.0
+                
+                for out, out2 in zip(outputs, outputs2):
+                    pred1 = torch.max(out.data, 1)[1]
+                    pred2 = torch.max(out2.data, 1)[1]
                     preds.append(pred1)
                     preds2.append(pred2)
-                    # 计算单个分类器的批次准确率
+                    
+                    # 批次准确率
                     batch_acc1 += float(torch.sum(pred1 == labels.data)) / now_batch_size
                     batch_acc2 += float(torch.sum(pred2 == labels3.data)) / now_batch_size
-                # 平均所有分类器的批次准确率
+                
+                # 平均准确率
                 batch_acc1 /= len(preds)
                 batch_acc2 /= len(preds2)
             else:
@@ -240,42 +281,43 @@ def train_model(model, opt, model_test, optimizer, scheduler, num_epochs=25):
                 _, pred2 = torch.max(outputs2.data, 1)
                 preds = pred1
                 preds2 = pred2
-                # 计算批次准确率
+                
                 batch_acc1 = float(torch.sum(pred1 == labels.data)) / now_batch_size
                 batch_acc2 = float(torch.sum(pred2 == labels3.data)) / now_batch_size
-
+            
+            # KL散度损失（如果启用）
             kl_loss = torch.tensor(0.0).cuda()
             if opt.views == 2:
-                # 分类损失：satellite 对应 labels，drone 对应 labels3
-                cls_loss = cal_loss(outputs, labels, criterion) + cal_loss(outputs2, labels3, criterion)
+                cls_loss = cal_loss(outputs, labels, criterion) + \
+                          cal_loss(outputs2, labels3, criterion)
                 if opt.kl_loss:
                     kl_loss = cal_kl_loss(outputs, outputs2, loss_kl)
+            
             elif opt.views == 3:
-                # 适配 DINOv2 输出
-                if opt.dinov2:
-                    outputs3 = outputs3[0]
-                else:
-                    outputs3 = outputs3[0]
+                # 3视图情况（如果需要）
+                if isinstance(outputs, tuple) and len(outputs) == 2:
+                    predictions3, features3 = outputs3
+                    outputs3 = predictions3
                 
                 if isinstance(outputs, list):
                     preds3 = []
                     for out3 in outputs3:
                         preds3.append(torch.max(out3.data, 1)[1])
-                    cls_loss = cal_loss(outputs, labels, criterion) + cal_loss(outputs2, labels3, criterion) + cal_loss(outputs3,labels2,criterion)
-                    loss += cls_loss
                 else:
                     _, preds3 = torch.max(outputs3.data, 1)
-                    cls_loss = cal_loss(outputs, labels, criterion) + cal_loss(outputs2, labels3, criterion) + cal_loss(outputs3,labels2,criterion)
-                    loss += cls_loss
-
-            # 总损失
+                
+                cls_loss = cal_loss(outputs, labels, criterion) + \
+                          cal_loss(outputs2, labels3, criterion) + \
+                          cal_loss(outputs3, labels2, criterion)
+            
+            # ========== 总损失 ==========
             loss = kl_loss + cls_loss + f_triplet_loss
             
             # 热身阶段
-            if epoch<opt.warm_epoch and phase == 'train': 
+            if epoch < opt.warm_epoch and phase == 'train':
                 warm_up = min(1.0, warm_up + 0.9 / warm_iteration)
                 loss *= warm_up
-
+            
             # 反向传播
             if phase == 'train':
                 if opt.autocast:
@@ -459,6 +501,26 @@ def draw_curve(current_epoch):
 # Finetuning the convnet
 # ----------------------
 if not opt.resume:
+    # ⭐ 在创建模型前，确保新参数存在
+    opt.use_structure_aware = getattr(opt, 'use_structure_aware', False)
+    opt.use_hybrid = getattr(opt, 'use_hybrid', False)
+    
+    # ⭐ 打印配置信息
+    print("\n" + "="*70)
+    print("Model Configuration:")
+    print("="*70)
+    if opt.dinov2:
+        print(f"  - Backbone: DINOv2-{opt.dinov2_size}")
+        print(f"  - Freeze backbone: {opt.freeze_backbone}")
+    else:
+        print(f"  - Backbone: {opt.model}")
+    
+    print(f"  - Structure-Aware: {'🔥 ENABLED' if opt.use_structure_aware else '⭕ DISABLED'}")
+    print(f"  - Hybrid: {'🔥 ENABLED' if opt.use_hybrid else '⭕ DISABLED'}")
+    print(f"  - Classes: {opt.nclasses}")
+    print(f"  - Block: {opt.block}")
+    print("="*70 + "\n")
+    
     model = make_model(opt)
     # save opts
     with open('%s/opts.yaml'%dir_name,'a') as fp:
@@ -471,7 +533,14 @@ if start_epoch>=40:
 # 优化器配置
 if opt.dinov2:
     if opt.freeze_backbone:
-        print("Freezing DINOv2 backbone, only training classifiers")
+        print("="*70)
+        print("DINOv2 Training Config:")
+        print("  - Backbone: FROZEN (no gradient)")
+        print("  - Only training classifiers")
+        print(f"  - Learning rate: {opt.lr}")
+        print("="*70)
+        
+        # 只优化非backbone参数
         params_to_optimize = []
         for name, param in model.named_parameters():
             if 'backbone' not in name and param.requires_grad:
@@ -487,23 +556,32 @@ if opt.dinov2:
         
         exp_lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(
             optimizer_ft,
-            milestones=opt.steps,
+            milestones=opt.steps,  # 默认 [80, 120]
             gamma=0.1
         )
+    
     else:
-        print("Training DINOv2 backbone with lower learning rate")
+        print("="*70)
+        print("DINOv2 Training Config:")
+        print("  - Backbone: TRAINABLE (with lower LR)")
+        print(f"  - Backbone LR: {opt.lr * 0.01} (1% of base LR)")
+        print(f"  - Classifier LR: {opt.lr}")
+        print("="*70)
+        
+        # 分离backbone和其他参数
         backbone_params = []
         other_params = []
         
         for name, param in model.named_parameters():
             if param.requires_grad:
-                if 'backbone' in name:
+                if 'backbone' in name or 'convnext' in name:
                     backbone_params.append(param)
                 else:
                     other_params.append(param)
         
+        # ✅ 关键修改：backbone学习率降低到1%（原来是10%，太大了）
         optimizer_ft = torch.optim.SGD([
-            {'params': backbone_params, 'lr': opt.lr * 0.1},
+            {'params': backbone_params, 'lr': opt.lr * 0.01},  # 改为0.01
             {'params': other_params, 'lr': opt.lr}
         ], weight_decay=5e-4, momentum=0.9, nesterov=True)
         
@@ -512,7 +590,9 @@ if opt.dinov2:
             milestones=opt.steps,
             gamma=0.1
         )
+
 else:
+    from optimizers.make_optimizer import make_optimizer
     optimizer_ft, exp_lr_scheduler = make_optimizer(model, opt)
 
 ######################################################################
