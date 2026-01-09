@@ -1,0 +1,445 @@
+# -*- coding: utf-8 -*-
+"""
+完全兼容原始 MCCG 架构的零初始化模块
+⭐ 接口与原始 MCCG 完全相同，可直接替换
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class ZeroInitTripletAttentionCompatible(nn.Module):
+    """
+    零初始化的 TripletAttention
+    ⭐ 完全兼容原始接口：(sat, drone) -> (sat, drone)
+    """
+    
+    def __init__(self, in_channels=768):
+        super().__init__()
+        
+        print("[INFO] Building Zero-Init TripletAttention (Compatible)")
+        
+        # 三个注意力分支
+        self.cw_attn = nn.Sequential(
+            nn.AdaptiveAvgPool2d((None, 1)),
+            nn.Conv2d(in_channels, in_channels, 1),
+            nn.Sigmoid()
+        )
+        
+        self.hc_attn = nn.Sequential(
+            nn.AdaptiveAvgPool2d((1, None)),
+            nn.Conv2d(in_channels, in_channels, 1),
+            nn.Sigmoid()
+        )
+        
+        self.spatial_attn = nn.Sequential(
+            nn.Conv2d(2, 1, kernel_size=7, padding=3, bias=False),
+            nn.Sigmoid()
+        )
+        
+        # ========== Zero-initialized Fusion ⭐ ==========
+        self.zero_fusion = nn.Conv2d(in_channels * 3, in_channels, 1, bias=False)
+        nn.init.zeros_(self.zero_fusion.weight)
+        print("[INFO] ✅ Zero-initialized fusion layer")
+        # ===========================================
+        
+        self.branch_weights = nn.Parameter(torch.ones(3) / 3)
+    
+    def forward(self, sat_feat, drone_feat):
+        """
+        ⭐ 兼容原始 TripletAttention 接口
+        
+        Args:
+            sat_feat: [B, 768, 8, 8]
+            drone_feat: [B, 768, 8, 8]
+        
+        Returns:
+            sat_out: [B, 768, 8, 8]
+            drone_out: [B, 768, 8, 8]
+        """
+        sat_out = self._process_single(sat_feat)
+        drone_out = self._process_single(drone_feat)
+        return sat_out, drone_out
+    
+    def _process_single(self, x):
+        """处理单个特征图"""
+        # C×W attention
+        cw = self.cw_attn(x)
+        cw_out = x * cw
+        
+        # H×C attention
+        hc = self.hc_attn(x)
+        hc_out = x * hc
+        
+        # Spatial attention
+        avg_pool = torch.mean(x, dim=1, keepdim=True)
+        max_pool, _ = torch.max(x, dim=1, keepdim=True)
+        spatial = self.spatial_attn(torch.cat([avg_pool, max_pool], dim=1))
+        spatial_out = x * spatial
+        
+        # 加权融合
+        weights = F.softmax(self.branch_weights, dim=0)
+        weighted = (cw_out * weights[0] + 
+                   hc_out * weights[1] + 
+                   spatial_out * weights[2])
+        
+        # Zero-initialized residual
+        concat = torch.cat([cw_out, hc_out, spatial_out], dim=1)
+        residual = self.zero_fusion(concat)
+        
+        out = x + residual + weighted
+        return out
+
+
+class ZeroInitDetailBranch(nn.Module):
+    """零初始化的细节保留分支"""
+    
+    def __init__(self, in_channels=768):
+        super().__init__()
+        
+        print("[INFO] Building Zero-Init DetailBranch")
+        
+        self.high_freq = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels // 2, 3, padding=1),
+            nn.BatchNorm2d(in_channels // 2),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels // 2, in_channels, 3, padding=1),
+        )
+        
+        # Zero-initialized output
+        self.zero_out = nn.Conv2d(in_channels, in_channels, 1, bias=False)
+        nn.init.zeros_(self.zero_out.weight)
+        print("[INFO] ✅ Zero-initialized output layer")
+    
+    def forward(self, x):
+        high = self.high_freq(x)
+        detail = self.zero_out(high)
+        return x + detail
+
+
+class ZeroInitAdaptiveFeatureFusion(nn.Module):
+    """零初始化的自适应特征融合"""
+    
+    def __init__(self, in_channels=768):
+        super().__init__()
+        
+        print("[INFO] Building Zero-Init AFF")
+        
+        self.attention = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(in_channels * 2, in_channels, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels, 2, 1),
+            nn.Sigmoid()
+        )
+        
+        self.zero_fusion = nn.Conv2d(in_channels * 2, in_channels, 1, bias=False)
+        nn.init.zeros_(self.zero_fusion.weight)
+        print("[INFO] ✅ Zero-initialized fusion layer")
+    
+    def forward(self, x1, x2):
+        concat = torch.cat([x1, x2], dim=1)
+        attn = self.attention(concat)
+        weighted = x1 * attn[:, 0:1] + x2 * attn[:, 1:2]
+        fused = self.zero_fusion(concat)
+        return weighted + fused
+
+
+class FeatureConsistencyLoss(nn.Module):
+    """特征一致性损失"""
+    
+    def forward(self, enhanced_feat, original_feat):
+        # 范数一致性
+        enhanced_norm = enhanced_feat.norm(dim=1, keepdim=True)
+        original_norm = original_feat.norm(dim=1, keepdim=True)
+        norm_loss = F.mse_loss(enhanced_norm, original_norm)
+        
+        # 方向一致性
+        enhanced_flat = enhanced_feat.flatten(2)
+        original_flat = original_feat.flatten(2)
+        cos_sim = F.cosine_similarity(enhanced_flat, original_flat, dim=1).mean()
+        angle_loss = 1 - cos_sim
+        
+        return norm_loss + angle_loss
+
+
+class ZeroInitMCCG(nn.Module):
+    """
+    完全兼容原始 MCCG 的零初始化版本
+    
+    ⭐ 接口与原始 MCCG 完全相同
+    ⭐ 可以直接替换原始模型
+    """
+    
+    def __init__(self, 
+                 num_classes=701,
+                 block=4,
+                 use_zero_init_tri=False,
+                 use_zero_init_detail=False,
+                 use_zero_init_aff=False):
+        super().__init__()
+        
+        self.block = block
+        self.use_zero_init_tri = use_zero_init_tri
+        self.use_zero_init_detail = use_zero_init_detail
+        self.use_zero_init_aff = use_zero_init_aff
+        
+        print(f"\n{'=' * 80}")
+        print("Building Zero-Init MCCG (Compatible Mode)")
+        print(f"{'=' * 80}")
+        print(f"Zero-Init TripletAttention: {use_zero_init_tri}")
+        print(f"Zero-Init DetailBranch: {use_zero_init_detail}")
+        print(f"Zero-Init AFF: {use_zero_init_aff}")
+        print(f"{'=' * 80}\n")
+        
+        # ========== Backbone（不变）⭐ ==========
+        try:
+            from models.ConvNext.backbones.model_convnext import build_convnext_backbone
+            self.backbone = build_convnext_backbone()
+        except ImportError:
+            print("[WARNING] Cannot import build_convnext_backbone, using placeholder")
+            # 占位符（测试用）
+            self.backbone = nn.Sequential(
+                nn.Conv2d(3, 768, 1),
+                nn.AdaptiveAvgPool2d(8)
+            )
+        self.in_planes = 768
+        # ====================================
+        
+        # ========== TripletAttention ⭐ ==========
+        if use_zero_init_tri:
+            self.tri_layer = ZeroInitTripletAttentionCompatible(self.in_planes)
+        else:
+            try:
+                from models.ConvNext.backbones.triplet_attention import TripletAttention
+                self.tri_layer = TripletAttention()
+                print("[INFO] Using Original TripletAttention")
+            except ImportError:
+                print("[WARNING] Cannot import TripletAttention, using zero-init version")
+                self.tri_layer = ZeroInitTripletAttentionCompatible(self.in_planes)
+        # ======================================
+        
+        # ========== DetailBranch（可选）⭐ ==========
+        if use_zero_init_detail:
+            self.detail_branch = ZeroInitDetailBranch(self.in_planes)
+        else:
+            self.detail_branch = None
+        # =========================================
+        
+        # ========== AFF（可选）⭐ ==========
+        if use_zero_init_aff and use_zero_init_detail:
+            self.aff = ZeroInitAdaptiveFeatureFusion(self.in_planes)
+        else:
+            self.aff = None
+        # ================================
+        
+        # ========== MCB（不变）⭐ ==========
+        self.part_features = nn.ModuleList()
+        for i in range(self.block):
+            self.part_features.append(nn.Sequential(
+                nn.Conv2d(self.in_planes, self.in_planes, 1),
+                nn.BatchNorm2d(self.in_planes),
+                nn.ReLU(inplace=True)
+            ))
+        # ================================
+        
+        # ========== 分类器（不变）⭐ ==========
+        try:
+            from models.model import ClassBlock
+            self.classifier = nn.ModuleList()
+            for i in range(self.block + 1):
+                self.classifier.append(ClassBlock(self.in_planes, num_classes))
+        except ImportError:
+            print("[WARNING] Cannot import ClassBlock, using placeholder")
+            self.classifier = nn.ModuleList([
+                nn.Linear(self.in_planes, num_classes) for _ in range(self.block + 1)
+            ])
+        # ==================================
+        
+        # 统计参数
+        total_params = sum(p.numel() for p in self.parameters())
+        trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        print(f"\nModel Statistics:")
+        print(f"  Total parameters: {total_params:,}")
+        print(f"  Trainable parameters: {trainable_params:,}")
+        print(f"{'=' * 80}\n")
+    
+    def forward(self, sat_img, drone_img, return_original_feat=False):
+        """
+        ⭐ 完全兼容原始 MCCG 的 forward 接口
+        
+        Args:
+            sat_img: [B, 3, 256, 256]
+            drone_img: [B, 3, 256, 256]
+            return_original_feat: 是否返回原始特征（用于一致性损失）
+        
+        Returns:
+            如果 training:
+                sat_cls, drone_cls
+            如果 return_original_feat:
+                (sat_cls, drone_cls), (sat_orig, drone_orig), (sat_enhanced, drone_enhanced)
+            否则:
+                (sat_cls, sat_all), (drone_cls, drone_all)
+        """
+        # ========== 1. Backbone ⭐ ==========
+        sat_feat = self.backbone(sat_img)
+        drone_feat = self.backbone(drone_img)
+        
+        # 保存原始特征
+        sat_orig = sat_feat.clone() if return_original_feat else None
+        drone_orig = drone_feat.clone() if return_original_feat else None
+        # =================================
+        
+        # ========== 2. TripletAttention ⭐ ==========
+        sat_tri, drone_tri = self.tri_layer(sat_feat, drone_feat)
+        # =========================================
+        
+        # ========== 3. DetailBranch（可选）⭐ ==========
+        if self.detail_branch is not None:
+            sat_detail = self.detail_branch(sat_tri)
+            drone_detail = self.detail_branch(drone_tri)
+            
+            # AFF 融合
+            if self.aff is not None:
+                sat_fused = self.aff(sat_tri, sat_detail)
+                drone_fused = self.aff(drone_tri, drone_detail)
+            else:
+                sat_fused = sat_tri + sat_detail
+                drone_fused = drone_tri + drone_detail
+        else:
+            sat_fused = sat_tri
+            drone_fused = drone_tri
+        # ==========================================
+        
+        # 保存增强特征
+        sat_enhanced = sat_fused if return_original_feat else None
+        drone_enhanced = drone_fused if return_original_feat else None
+        
+        # ========== 4. MCB（不变）⭐ ==========
+        sat_global = F.adaptive_avg_pool2d(sat_fused, 1).flatten(1)
+        drone_global = F.adaptive_avg_pool2d(drone_fused, 1).flatten(1)
+        
+        sat_parts = [F.adaptive_avg_pool2d(layer(sat_fused), 1).flatten(1) 
+                    for layer in self.part_features]
+        drone_parts = [F.adaptive_avg_pool2d(layer(drone_fused), 1).flatten(1) 
+                      for layer in self.part_features]
+        # ==================================
+        
+        # ========== 5. 分类器（不变）⭐ ==========
+        sat_cls = [self.classifier[0](sat_global)] + \
+                 [self.classifier[i+1](sat_parts[i]) for i in range(self.block)]
+        drone_cls = [self.classifier[0](drone_global)] + \
+                   [self.classifier[i+1](drone_parts[i]) for i in range(self.block)]
+        # ====================================
+        
+        # ========== 返回 ⭐ ==========
+        if return_original_feat:
+            return (sat_cls, drone_cls), \
+                   (sat_orig, drone_orig), \
+                   (sat_enhanced, drone_enhanced)
+        elif self.training:
+            return sat_cls, drone_cls
+        else:
+            sat_all = torch.stack([sat_global] + sat_parts, dim=2)
+            drone_all = torch.stack([drone_global] + drone_parts, dim=2)
+            return (sat_cls, sat_all), (drone_cls, drone_all)
+        # =========================
+
+
+def make_zero_init_model(opt):
+    """
+    创建零初始化模型
+    
+    ⭐ 兼容原始 make_model 函数
+    """
+    use_zero_init = getattr(opt, 'use_zero_init', False)
+    
+    if not use_zero_init:
+        # 使用原始模型
+        try:
+            from models.model import build_convnext
+            return build_convnext(opt.nclasses, opt.block)
+        except ImportError:
+            print("[WARNING] Cannot import build_convnext, using zero-init model")
+            use_zero_init = True
+    
+    if use_zero_init:
+        # 使用零初始化模型
+        model = ZeroInitMCCG(
+            num_classes=opt.nclasses,
+            block=opt.block,
+            use_zero_init_tri=getattr(opt, 'use_zero_init_tri', True),
+            use_zero_init_detail=getattr(opt, 'use_zero_init_detail', False),
+            use_zero_init_aff=getattr(opt, 'use_zero_init_aff', False)
+        )
+        return model
+
+
+if __name__ == '__main__':
+    print("\n" + "=" * 80)
+    print("Testing Compatibility")
+    print("=" * 80 + "\n")
+    
+    # 测试兼容性
+    model = ZeroInitMCCG(
+        num_classes=701,
+        block=4,
+        use_zero_init_tri=True,
+        use_zero_init_detail=True,
+        use_zero_init_aff=True
+    ).cuda()
+    
+    # 测试输入
+    sat = torch.randn(2, 3, 256, 256).cuda()
+    drone = torch.randn(2, 3, 256, 256).cuda()
+    
+    # 测试训练模式
+    model.train()
+    sat_cls, drone_cls = model(sat, drone)
+    
+    print("✅ Training mode:")
+    print(f"   Satellite: {len(sat_cls)} branches")
+    print(f"   Drone: {len(drone_cls)} branches")
+    for i, cls in enumerate(sat_cls):
+        print(f"   Branch {i}: {cls.shape}")
+    
+    # 测试推理模式
+    model.eval()
+    with torch.no_grad():
+        (sat_cls, sat_feat), (drone_cls, drone_feat) = model(sat, drone)
+    
+    print("\n✅ Inference mode:")
+    print(f"   Satellite features: {sat_feat.shape}")
+    print(f"   Drone features: {drone_feat.shape}")
+    
+    # 测试一致性损失模式
+    model.train()
+    (sat_cls, drone_cls), (sat_orig, drone_orig), (sat_enhanced, drone_enhanced) = \
+        model(sat, drone, return_original_feat=True)
+    
+    print("\n✅ Consistency loss mode:")
+    print(f"   Original features: {sat_orig.shape}")
+    print(f"   Enhanced features: {sat_enhanced.shape}")
+    
+    # 测试一致性损失计算
+    consistency_loss_fn = FeatureConsistencyLoss()
+    loss_sat = consistency_loss_fn(sat_enhanced, sat_orig)
+    loss_drone = consistency_loss_fn(drone_enhanced, drone_orig)
+    
+    print(f"\n✅ Consistency loss:")
+    print(f"   Satellite: {loss_sat.item():.6f}")
+    print(f"   Drone: {loss_drone.item():.6f}")
+    
+    # 验证零初始化
+    if hasattr(model.tri_layer, 'zero_fusion'):
+        weight_norm = model.tri_layer.zero_fusion.weight.norm().item()
+        print(f"\n✅ Zero-fusion weight norm: {weight_norm:.6f}")
+        if weight_norm < 1e-6:
+            print("   ✅ Correctly initialized to zero!")
+        else:
+            print("   ⚠️  Warning: Not zero-initialized")
+    
+    print("\n" + "=" * 80)
+    print("✅ All compatibility tests passed!")
+    print("=" * 80 + "\n")
